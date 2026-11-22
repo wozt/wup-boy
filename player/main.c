@@ -104,7 +104,7 @@ static void state_set(const uint8_t *i) {
 
 /* ---- rewind: last = the state at the newest snapshot; ring = the differences, oldest first, each
    [u32 n][n bytes: (zeros, literals, the literal bytes)...][u32 n] */
-#define RING (80 << 10)
+#define RING (64 << 10)          /* (rewind depth ~5 s; the room left in WUP_BIGMEM is the heap the network threads need) */
 #define REC_MAX (48 << 10)
 /* one working copy of the state, for snapshots, saving and loading. Not in .bss with the rest (WUP_BIGMEM is full of
    the game): initialised, so it lives in the app's own area at 0x350000, which is nearly empty */
