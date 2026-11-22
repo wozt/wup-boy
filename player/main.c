@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include "wup.h"
 
 /* ---- paths: the ROM can live on the network share (/net/..., read-write server) or in this app's
@@ -319,9 +320,9 @@ int main(void) {
     snprintf(state_path, sizeof state_path, "%s/%s.state", sav, name);
     snprintf(sav + strlen(sav), sizeof sav - strlen(sav), "/%s.sav", name);
     int size = path[0] ? path_size(path) : -1;
-    if (size <= 0) { message("Can't Open Game", ""); back_to_list(); return 0; }
+    if (size <= 0) { char t[48]; snprintf(t, sizeof t, "open: errno %d", errno); message("Can't Open Game", t); back_to_list(); return 0; }
     if ((uint32_t)size > sizeof ROM) { message("Game Too Large", "Games up to 1 MB fit on the GamePad"); back_to_list(); return 0; }
-    if (path_read(path, 0, ROM, (uint32_t)size) != size) { message("Can't Open Game", ""); back_to_list(); return 0; }
+    if (path_read(path, 0, ROM, (uint32_t)size) != size) { char t[48]; snprintf(t, sizeof t, "read: errno %d", errno); message("Can't Open Game", t); back_to_list(); return 0; }
     rom_size = (uint32_t)size;
 restart:
     error_text[0] = 0; pal_valid = 0; rewind_reset();

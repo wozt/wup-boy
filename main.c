@@ -65,11 +65,12 @@ static int ensure_player(char *player, size_t cap) {
     char dir[96];
     snprintf(dir, sizeof dir, "%s", wup_app_dir()[0] ? wup_app_dir() : "/apps/wup_boy");
     snprintf(player, cap, "%s/player.wup", dir);
-    if (fs_filesize(player) > 0) return 1;
-    int fd = open("/net/wup_boy/player.wup", O_RDONLY);
-    if (fd < 0) return 0;
+    int local = fs_filesize(player);
+    int fd = open("/net/wup_boy/player.wup", O_RDONLY);       /* the share's copy: its size decides if the cache is current */
+    if (fd < 0) return local > 0;                             /* (offline: a cached one still plays) */
     struct stat st;
-    if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > (1 << 20)) { close(fd); return 0; }
+    if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > (1 << 20)) { close(fd); return local > 0; }
+    if (local == (int)st.st_size) { close(fd); return 1; }
     lfs_mkdir(&fs_lfs, dir);
     if (fs_stream_open(player)) { close(fd); return 0; }
     uint8_t buf[16384]; uint64_t left = (uint64_t)st.st_size; int bad = 0;
