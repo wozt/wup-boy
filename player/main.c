@@ -110,8 +110,7 @@ static void state_set(const uint8_t *i) {
    the game): initialised, so it lives in the app's own area at 0x350000, which is nearly empty */
 static uint8_t scratch[STATE_MAX] __attribute__((aligned(4))) = { 1 };
 #define EVERY 8
-static uint8_t last[STATE_MAX] __attribute__((aligned(4))) = { 1 };        /* initialised, like scratch: the app's own area, not WUP_BIGMEM (which the game fills) */
-static uint8_t ring[RING]; static uint32_t used, have_last;
+static uint8_t last[STATE_MAX] __attribute__((aligned(4))), ring[RING]; static uint32_t used, have_last;
 static uint8_t *put_n(uint8_t *o, uint32_t v) { while (v >= 128) { *o++ = (uint8_t)(v | 128); v >>= 7; } *o++ = (uint8_t)v; return o; }
 static const uint8_t *get_n(const uint8_t *i, uint32_t *v) { uint32_t x = 0; int s = 0; while (*i & 128) { x |= (uint32_t)(*i++ & 127) << s; s += 7; } *v = x | (uint32_t)*i++ << s; return i; }
 static void rewind_reset(void) { used = 0; have_last = 0; }
