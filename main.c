@@ -7,7 +7,9 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "wup_kit.h"
+#include "wup_lvgl.h"
 #include "littlefs/lfs.h"
 
 WUP_APP("WUP Boy");
@@ -56,10 +58,34 @@ static void scan(void) {
     }
     qsort(games, (size_t)ngames, sizeof games[0], by_name);
 }
+/* the player next to this app; when WUP Boy itself was fetched from /net there is none, so player.wup
+   is taken from the share's wup_boy/ folder once and cached in this app's own folder (/save/net/wup_boy
+   there; a subfolder of the share, so the menu's home does not list player.wup as an app of its own) */
+static int ensure_player(char *player, size_t cap) {
+    char dir[96];
+    snprintf(dir, sizeof dir, "%s", wup_app_dir()[0] ? wup_app_dir() : "/apps/wup_boy");
+    snprintf(player, cap, "%s/player.wup", dir);
+    if (fs_filesize(player) > 0) return 1;
+    int fd = open("/net/wup_boy/player.wup", O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > (1 << 20)) { close(fd); return 0; }
+    lfs_mkdir(&fs_lfs, dir);
+    if (fs_stream_open(player)) { close(fd); return 0; }
+    uint8_t buf[16384]; uint64_t left = (uint64_t)st.st_size; int bad = 0;
+    while (left) {
+        ssize_t k = read(fd, buf, left > sizeof buf ? sizeof buf : (size_t)left);
+        if (k <= 0 || fs_stream_write(buf, (uint32_t)k)) { bad = 1; break; }
+        left -= (uint64_t)k;
+    }
+    close(fd);
+    if (fs_stream_close() || bad) { fs_remove(player); return 0; }
+    return fs_filesize(player) == (int)st.st_size;
+}
 static void on_game(lv_event_t *e) {
     int i = (int)(intptr_t)lv_event_get_user_data(e);
-    char player[96];
-    snprintf(player, sizeof player, "%s/player.wup", wup_app_dir()[0] ? wup_app_dir() : "/apps/wup_boy");
+    char player[192];
+    if (!ensure_player(player, sizeof player)) { wup_alert("Player.wup Not Found", "Put player.wup next to wup_boy.wup, or in the share's wup_boy/ folder", "OK", NULL, NULL, 0); return; }
     if (!wup_exec(player, games[i].path)) started = 1;       /* (this app ends; the player is next) */
 }
 static void home(lv_obj_t *scr) {
