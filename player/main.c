@@ -21,7 +21,38 @@
  *     the core's callbacks. */
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "wup.h"
+
+/* ---- paths: the ROM can live on the network share (/net/..., read-write server) or in this app's
+   folder (littlefs). Saves and save states follow the ROM: a network game keeps them in /net/saves. ---- */
+static int path_net(const char *p) { return !strncmp(p, "/net/", 5) || !strcmp(p, "/net"); }
+static int path_read(const char *path, uint32_t off, void *dst, uint32_t len) {   /* len bytes at off, or -1 */
+    if (!path_net(path)) return fs_read(path, off, dst, len);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    if (lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return -1; }
+    uint8_t *o = dst; uint32_t left = len; int r = 0;
+    while (left) { ssize_t k = read(fd, o, left); if (k <= 0) break; o += k; left -= (uint32_t)k; r += (int)k; }
+    close(fd);
+    return r == (int)len ? r : -1;
+}
+static int path_size(const char *path) {
+    if (!path_net(path)) return fs_filesize(path);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    struct stat st; int r = fstat(fd, &st) ? -1 : (int)st.st_size; close(fd); return r;
+}
+static int wr_all(int fd, const void *src, uint32_t len) {                  /* a whole buffer, or -1 */
+    const uint8_t *o = src; uint32_t left = len;
+    while (left) { ssize_t k = write(fd, o, left); if (k <= 0) return -1; o += k; left -= (uint32_t)k; }
+    return 0;
+}
+static int path_write(const char *path, const void *src, uint32_t len) {    /* the whole file, or -1 */
+    if (!path_net(path)) return fs_write(path, src, len);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666); if (fd < 0) return -1;
+    int r = wr_all(fd, src, len); close(fd); return r;
+}
 
 /* the game and its battery memory, read where they lie (gen.py points the core's reads here; both sizes are powers of
    two: an address past the end wraps inside the array) */
@@ -72,13 +103,14 @@ static void state_set(const uint8_t *i) {
 
 /* ---- rewind: last = the state at the newest snapshot; ring = the differences, oldest first, each
    [u32 n][n bytes: (zeros, literals, the literal bytes)...][u32 n] */
-#define RING (144 << 10)
+#define RING (80 << 10)
 #define REC_MAX (48 << 10)
 /* one working copy of the state, for snapshots, saving and loading. Not in .bss with the rest (WUP_BIGMEM is full of
    the game): initialised, so it lives in the app's own area at 0x350000, which is nearly empty */
 static uint8_t scratch[STATE_MAX] __attribute__((aligned(4))) = { 1 };
 #define EVERY 8
-static uint8_t last[STATE_MAX] __attribute__((aligned(4))), ring[RING]; static uint32_t used, have_last;
+static uint8_t last[STATE_MAX] __attribute__((aligned(4))) = { 1 };        /* initialised, like scratch: the app's own area, not WUP_BIGMEM (which the game fills) */
+static uint8_t ring[RING]; static uint32_t used, have_last;
 static uint8_t *put_n(uint8_t *o, uint32_t v) { while (v >= 128) { *o++ = (uint8_t)(v | 128); v >>= 7; } *o++ = (uint8_t)v; return o; }
 static const uint8_t *get_n(const uint8_t *i, uint32_t *v) { uint32_t x = 0; int s = 0; while (*i & 128) { x |= (uint32_t)(*i++ & 127) << s; s += 7; } *v = x | (uint32_t)*i++ << s; return i; }
 static void rewind_reset(void) { used = 0; have_last = 0; }
@@ -200,14 +232,21 @@ static unsigned pressed(void) { wup_sleep(16); unsigned b = wup_buttons(), p = b
 static void state_save(void) {
     uint32_t n = state_size(), head[4] = { 0x54534247u /* "GBST" */, 1, n, gb.cgb.cgbMode };
     state_get(scratch);
+    if (path_net(state_path)) {                                 /* /net: two writes on one handle */
+        int fd = open(state_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        int bad = fd < 0 || wr_all(fd, head, 16) || wr_all(fd, scratch, n);
+        if (fd >= 0) close(fd);
+        if (!bad) { has_state = 1; just_saved = 1; } else unlink(state_path);
+        return;
+    }
     if (fs_stream_open(state_path)) return;
     int bad = fs_stream_write(head, 16) || fs_stream_write(scratch, n);
     if (!fs_stream_close() && !bad) { has_state = 1; just_saved = 1; } else fs_remove(state_path);
 }
 static int state_load(void) {
     uint32_t n = state_size(), head[4];
-    if (fs_read(state_path, 0, head, 16) != 16 || head[0] != 0x54534247u || head[1] != 1 || head[2] != n) return -1;   /* (another version's, another game's) */
-    if (fs_read(state_path, 16, scratch, n) != (int)n) return -1;
+    if (path_read(state_path, 0, head, 16) != 16 || head[0] != 0x54534247u || head[1] != 1 || head[2] != n) return -1;   /* (another version's, another game's) */
+    if (path_read(state_path, 16, scratch, n) != (int)n) return -1;
     state_set(scratch);
     return 0;
 }
@@ -233,7 +272,7 @@ static int confirm(const char *title, const char *line, const char *yes) {
     }
 }
 static int pause_menu(const char *name) {              /* -> RESUME, LOAD_STATE (loaded), RESTART or QUIT */
-    int sel = RESUME; just_saved = 0; has_state = fs_filesize(state_path) > 16;
+    int sel = RESUME; just_saved = 0; has_state = path_size(state_path) > 16;
     set_dim(1); pause_draw(name, sel);
     for (;;) {
         unsigned p = pressed(); int old = sel;
@@ -275,13 +314,14 @@ int main(void) {
     char name[64] = "", sav[160];
     const char *file = strrchr(path, '/'); file = file ? file + 1 : path;
     snprintf(name, sizeof name, "%s", file); if (strrchr(name, '.')) *strrchr(name, '.') = 0;
-    snprintf(sav, sizeof sav, "%s/saves", wup_app_dir()[0] ? wup_app_dir() : "/apps/wup_boy"); lfs_mkdir(&fs_lfs, sav);
+    if (path_net(path)) snprintf(sav, sizeof sav, "/net/saves");            /* a network game's saves live with it */
+    else { snprintf(sav, sizeof sav, "%s/saves", wup_app_dir()[0] ? wup_app_dir() : "/apps/wup_boy"); lfs_mkdir(&fs_lfs, sav); }
     snprintf(state_path, sizeof state_path, "%s/%s.state", sav, name);
     snprintf(sav + strlen(sav), sizeof sav - strlen(sav), "/%s.sav", name);
-    int size = path[0] ? fs_filesize(path) : -1;
+    int size = path[0] ? path_size(path) : -1;
     if (size <= 0) { message("Can't Open Game", ""); back_to_list(); return 0; }
     if ((uint32_t)size > sizeof ROM) { message("Game Too Large", "Games up to 1 MB fit on the GamePad"); back_to_list(); return 0; }
-    if (fs_read(path, 0, ROM, (uint32_t)size) != size) { message("Can't Open Game", ""); back_to_list(); return 0; }
+    if (path_read(path, 0, ROM, (uint32_t)size) != size) { message("Can't Open Game", ""); back_to_list(); return 0; }
     rom_size = (uint32_t)size;
 restart:
     error_text[0] = 0; pal_valid = 0; rewind_reset();
@@ -289,7 +329,7 @@ restart:
     ram_size = (uint32_t)gb_get_save_size(&gb);
     if (ram_size > sizeof CART_RAM) ram_size = sizeof CART_RAM;
     memset(CART_RAM, 0xff, sizeof CART_RAM);
-    if (ram_size) fs_read(sav, 0, CART_RAM, ram_size);
+    if (ram_size) path_read(sav, 0, CART_RAM, ram_size);
     gb_init_lcd(&gb, draw_line);
     audio_init();
     int sound = wup_audio_open() == 0, quit = 0;
@@ -305,7 +345,7 @@ restart:
         unsigned b = wup_buttons(), p = b & ~held; held = b;
         if (p & WUP_HOME) {
             if (sound) wup_audio_close();
-            if (ram_size) fs_write(sav, CART_RAM, ram_size);
+            if (ram_size) path_write(sav, CART_RAM, ram_size);
             int r = pause_menu(name);
             if (r == QUIT) { quit = 1; break; }
             clear(); wup_present8(0, GFX_H); mode = 0;
@@ -364,7 +404,7 @@ restart:
         late += ahead < 0;
         if (wup_us() - t_stat > 5000000) { printf("[gb] %u fps, %d late, rewind %u KB\n", (unsigned)((uint32_t)frames * 1000000u / (wup_us() - t_stat)), late, (unsigned)(used >> 10)); t_stat = wup_us(); frames = late = 0; }
     }
-    if (!quit) { wup_audio_close(); if (ram_size) fs_write(sav, CART_RAM, ram_size); message("The Game Stopped", error_text); }
+    if (!quit) { wup_audio_close(); if (ram_size) path_write(sav, CART_RAM, ram_size); message("The Game Stopped", error_text); }
     back_to_list();
     return 0;
 }
