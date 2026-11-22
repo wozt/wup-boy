@@ -3,11 +3,8 @@
  * Quit; Load State and Restart ask first); leaving goes back
  * to WUP Boy. The save (the cartridge's battery memory) is kept in saves/<game>.sav,
  * written at each pause and on leaving; the save state (the whole machine at one moment) in saves/<game>.state.
- *   Controls: A and B (X and Y too), + Start, - Select, the D-pad or the left stick. Hold ZL: rewind. Hold ZR: fast
+ *   Controls: A and B (X and Y too), + Start, - Select, the D-pad or the left stick. Hold ZR: fast
  *     forward (as fast as the GamePad manages, without sound).
- *   Rewind: every 8th frame the machine's state (50 KB and the battery memory) is compared with the one before; what
- *     changed (XOR, the zeros run-length packed: a few KB) goes on a ring of 144 KB, the oldest falling off. Going back
- *     applies the newest difference to the last state: the same XOR undoes it. Usually well over 10 seconds.
  *   Picture: the firmware's 8-bit layer, no RGB565 screen: 160x144 three times as big (480x432), centred. A Game Boy
  *     Color frame has at most 64 colours (8 background and 8 sprite palettes of 4): palette entries 0..63; the first
  *     Game Boy's shades are 64..79. The pause screen's own colours are 208 and up.
@@ -89,7 +86,7 @@ static void on_error(struct gb_s *g, const enum gb_error_e e, const uint16_t add
     printf("[gb] %s\n", error_text);
 }
 
-/* ---- the machine's state in one piece: the core, the battery memory, the sound. For save states and rewind */
+/* ---- the machine's state in one piece: the core, the battery memory, the sound. For save states */
 #define STATE_MAX (sizeof(struct gb_s) + sizeof CART_RAM + 512)
 static uint32_t state_size(void) { return (uint32_t)sizeof gb + ram_size + audio_state(0, 0); }
 static void state_get(uint8_t *o) { memcpy(o, &gb, sizeof gb); memcpy(o + sizeof gb, CART_RAM, ram_size); audio_state(o + sizeof gb + ram_size, 0); }
@@ -102,51 +99,9 @@ static void state_set(const uint8_t *i) {
     memcpy(CART_RAM, i + sizeof gb, ram_size); audio_state((uint8_t *)(uintptr_t)(i + sizeof gb + ram_size), 1);
 }
 
-/* ---- rewind: last = the state at the newest snapshot; ring = the differences, oldest first, each
-   [u32 n][n bytes: (zeros, literals, the literal bytes)...][u32 n] */
-#define RING (64 << 10)          /* (rewind depth ~5 s; the room left in WUP_BIGMEM is the heap the network threads need) */
-#define REC_MAX (48 << 10)
-/* one working copy of the state, for snapshots, saving and loading. Not in .bss with the rest (WUP_BIGMEM is full of
+/* one working copy of the machine's state, for saving and loading. Not in .bss with the rest (WUP_BIGMEM is full of
    the game): initialised, so it lives in the app's own area at 0x350000, which is nearly empty */
 static uint8_t scratch[STATE_MAX] __attribute__((aligned(4))) = { 1 };
-#define EVERY 8
-static uint8_t last[STATE_MAX] __attribute__((aligned(4))), ring[RING]; static uint32_t used, have_last;
-static uint8_t *put_n(uint8_t *o, uint32_t v) { while (v >= 128) { *o++ = (uint8_t)(v | 128); v >>= 7; } *o++ = (uint8_t)v; return o; }
-static const uint8_t *get_n(const uint8_t *i, uint32_t *v) { uint32_t x = 0; int s = 0; while (*i & 128) { x |= (uint32_t)(*i++ & 127) << s; s += 7; } *v = x | (uint32_t)*i++ << s; return i; }
-static void rewind_reset(void) { used = 0; have_last = 0; }
-static void rewind_capture(void) {
-    static uint8_t rec[REC_MAX + 64];
-    uint8_t *now = scratch; uint32_t n = state_size(); state_get(now);
-    if (!have_last) { memcpy(last, now, n); have_last = 1; used = 0; return; }
-    uint8_t *o = rec; uint32_t i = 0;
-    while (i < n && o - rec < REC_MAX) {
-        uint32_t z = i;
-        while (z < n && (z & 3) && now[z] == last[z]) z++;      /* what has not changed: a word at a time once aligned */
-        if (!(z & 3)) while (z + 4 <= n && *(const uint32_t *)(now + z) == *(const uint32_t *)(last + z)) z += 4;
-        while (z < n && now[z] == last[z]) z++;
-        uint32_t l = z; while (l < n && (now[l] != last[l] || (l + 1 < n && now[l + 1] != last[l + 1]))) l++;   /* (a lone equal byte stays in the literal) */
-        o = put_n(o, z - i); o = put_n(o, l - z);
-        if ((uint32_t)(o - rec) + (l - z) > REC_MAX) { o = rec + REC_MAX; break; }
-        for (uint32_t k = z; k < l; k++) *o++ = now[k] ^ last[k];
-        i = l;
-    }
-    uint32_t len = (uint32_t)(o - rec), need = len + 8;
-    memcpy(last, now, n);
-    if (len >= REC_MAX) { used = 0; return; }              /* (nearly everything changed: nothing to go back through) */
-    uint32_t drop = 0;
-    while (used - drop + need > RING) { uint32_t k; memcpy(&k, ring + drop, 4); drop += k + 8; }
-    if (drop) { memmove(ring, ring + drop, used - drop); used -= drop; }
-    memcpy(ring + used, &len, 4); memcpy(ring + used + 4, rec, len); memcpy(ring + used + 4 + len, &len, 4); used += need;
-}
-static int rewind_step(void) {                         /* one snapshot back: 1, or 0 at the oldest */
-    if (!have_last || !used) return 0;
-    uint32_t len; memcpy(&len, ring + used - 4, 4);
-    const uint8_t *i = ring + used - 4 - len, *e = i + len; uint32_t at = 0;
-    while (i < e) { uint32_t z, l; i = get_n(i, &z); i = get_n(i, &l); at += z; for (uint32_t k = 0; k < l; k++) last[at++] ^= *i++; }
-    used -= len + 8;
-    state_set(last);
-    return 1;
-}
 
 /* ---- the picture: one Game Boy line -> three rows of 480 */
 static void draw_line(struct gb_s *g, const uint8_t *px, const uint_fast8_t line) {
@@ -224,7 +179,7 @@ static void pause_draw(const char *name, int sel) {
         text(&font_label, PX + 28, ry + 33, rows[i], r, off ? 6 : 15);
         if (i == SAVE_STATE && just_saved) text(&font_body, PX + PW - 28 - text_w(&font_body, "Saved"), ry + 31, "Saved", r, 10);
     }
-    text_c(&font_body, y + h - 20, "ZL  Rewind        ZR  Fast Forward", PANEL, 8);
+    text_c(&font_body, y + h - 20, "ZR  Fast Forward", PANEL, 8);
     wup_present8(0, GFX_H);
 }
 static unsigned held;
@@ -324,7 +279,7 @@ int main(void) {
     if (path_read(path, 0, ROM, (uint32_t)size) != size) { char t[48]; snprintf(t, sizeof t, "read: errno %d", errno); message("Can't Open Game", t); back_to_list(); return 0; }
     rom_size = (uint32_t)size;
 restart:
-    error_text[0] = 0; pal_valid = 0; rewind_reset();
+    error_text[0] = 0; pal_valid = 0;
     if (gb_init(&gb, rom_read, ram_read, ram_write, on_error, 0) != GB_INIT_NO_ERROR) { message("Can't Play Game", "Not a Game Boy game, or a cartridge type not supported"); back_to_list(); return 0; }
     ram_size = (uint32_t)gb_get_save_size(&gb);
     if (ram_size > sizeof CART_RAM) ram_size = sizeof CART_RAM;
@@ -338,7 +293,7 @@ restart:
     clear(); wup_present8(0, GFX_H);
 
     const uint32_t frame_us = 16743;                    /* 59.73 Hz */
-    uint32_t next = wup_us(), t_stat = next; int frames = 0, late = 0, count = 0, mode = 0, back_wait = 0;
+    uint32_t next = wup_us(), t_stat = next; int frames = 0, late = 0, mode = 0;
     void (*draw)(struct gb_s *, const uint8_t *, const uint_fast8_t) = gb.display.lcd_draw_line;
     held = wup_buttons();
     while (!error_text[0] && !quit) {
@@ -350,20 +305,15 @@ restart:
             if (r == QUIT) { quit = 1; break; }
             clear(); wup_present8(0, GFX_H); mode = 0;
             if (r == RESTART) goto restart;              /* (the save was just written: it starts from it) */
-            if (r == LOAD_STATE) { pal_valid = 0; rewind_reset(); }
+            if (r == LOAD_STATE) pal_valid = 0;
             sound = wup_audio_open() == 0; next = wup_us(); held = wup_buttons();
             continue;
         }
-        int now = b & WUP_ZL ? 1 : b & WUP_ZR ? 2 : 0;       /* 1 rewinding, 2 fast forward */
+        int now = b & WUP_ZR ? 2 : 0;                           /* 2 fast forward */
         if (now != mode) {                                   /* said in the margin, quietly */
             box(0, GFX_H - 44, X0, 44, BLACK);
-            if (now) text(&font_body, 24, GFX_H - 18, now == 1 ? "Rewind" : "Fast Forward", PANEL, 9);
-            wup_present8(GFX_H - 44, 44); mode = now; next = wup_us(); back_wait = 0;
-        }
-        if (mode == 1) {                                     /* back a snapshot every 4th frame: twice as fast as it went */
-            if (back_wait-- <= 0) { back_wait = 3; if (rewind_step()) { pal_valid = 0; gb.direct.joypad = 0xff; gb_run_frame(&gb); update_palette(); wup_present8(Y0, 144 * SCALE); have_last = 1; state_get(last); } }
-            wup_sleep(16); count = 0;
-            continue;
+            if (now) text(&font_body, 24, GFX_H - 18, "Fast Forward", PANEL, 9);
+            wup_present8(GFX_H - 44, 44); mode = now; next = wup_us();
         }
         int sx = wup_stick(0, 0), sy = wup_stick(0, 1);
         uint8_t j = 0xff;                               /* active low: a b select start right left up down */
@@ -378,7 +328,7 @@ restart:
         gb.direct.joypad = j;
         if (mode == 2) {                                     /* three frames unseen, then one shown; no sound, no waiting */
             gb.direct.frame_skip = 0; gb.display.lcd_draw_line = 0;
-            for (int k = 0; k < 3 && !error_text[0]; k++) { gb_run_frame(&gb); if (++count % EVERY == 0) rewind_capture(); }
+            for (int k = 0; k < 3 && !error_text[0]; k++) gb_run_frame(&gb);
             gb.display.lcd_draw_line = draw;
         }
         static int undrawn, to_skip;                         /* behind: this many frames go undrawn after each drawn one */
@@ -386,7 +336,6 @@ restart:
         if (mode != 2) { gb.direct.frame_skip = 0; gb.display.lcd_draw_line = shown ? draw : 0; undrawn = shown ? 0 : undrawn + 1; }
         gb_run_frame(&gb);
         gb.display.lcd_draw_line = draw;
-        if (++count % EVERY == 0) rewind_capture();
         if (sound && mode != 2) {
             audio_callback(0, (uint8_t *)snd, (int)sizeof snd);
             const uint32_t *in = (const uint32_t *)snd; uint32_t *o = (uint32_t *)out;                 /* (a stereo pair is one word) */
@@ -402,7 +351,7 @@ restart:
         else { wup_sleep(1); if (ahead < -(int32_t)frame_us * 4) next = wup_us(); }
         to_skip = ahead < -(int32_t)frame_us * 2 ? 2 : ahead < -(int32_t)frame_us / 2 ? 1 : 0;
         late += ahead < 0;
-        if (wup_us() - t_stat > 5000000) { printf("[gb] %u fps, %d late, rewind %u KB\n", (unsigned)((uint32_t)frames * 1000000u / (wup_us() - t_stat)), late, (unsigned)(used >> 10)); t_stat = wup_us(); frames = late = 0; }
+        if (wup_us() - t_stat > 5000000) { printf("[gb] %u fps, %d late\n", (unsigned)((uint32_t)frames * 1000000u / (wup_us() - t_stat)), late); t_stat = wup_us(); frames = late = 0; }
     }
     if (!quit) { wup_audio_close(); if (ram_size) path_write(sav, CART_RAM, ram_size); message("The Game Stopped", error_text); }
     back_to_list();

@@ -12,7 +12,7 @@ Get it in the GamePad's **App Store**.
   files to `apps/wup_boy/roms` (FTP). Games up to 1 MB fit.
 - **Play**: A and B (X and Y too), **+** Start, **−** Select, the D-pad or the left stick.
 - **HOME** pauses: Resume, Save State, Load State, Restart, Quit.
-- Hold **ZL** to rewind, **ZR** to fast forward.
+- Hold **ZR** to fast forward.
 - The game's own save (its battery memory) is kept at every pause and when you quit, in `apps/wup_boy/saves`,
   with the save state next to it.
 
@@ -21,7 +21,7 @@ Get it in the GamePad's **App Store**.
 Two apps in one folder: the list of games (`main.c`, in the Homebrew Menu's look: libwup's kit) and the player it starts
 with a game's path (`player/main.c`), which draws on the GamePad's 8-bit layer so the whole game fits in memory. The
 emulation is [Peanut-GB](https://github.com/deltabeard/Peanut-GB) (its `cgb` branch) with minigb_apu for sound, both MIT,
-fetched by the build. Rewind keeps a ring of the differences between snapshots of the machine (XOR, run-length packed).
+fetched by the build.
 
 Build it with [libwup](https://github.com/ravensclawx/wup-homebrew/tree/main/libwup), the GamePad SDK:
 
